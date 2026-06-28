@@ -1,98 +1,147 @@
 import sounddevice as sd
-from scipy.io.wavfile import write
 import numpy as np
-import os
-import whisper
+from scipy.io.wavfile import write
+from funasr import AutoModel
 from openai import OpenAI
-import pyttsx3
+import edge_tts
+from pydub import AudioSegment
+from pydub.playback import play
+import io
+import webrtcvad
+import time
+import os
 
 # ================= 配置区 =================
-DEEPSEEK_API_KEY = "sk-xxx"  # ⚠️ 替换为你自己的 DeepSeek API Key
-MODEL_SIZE = "tiny"                # Whisper 模型大小 (tiny, base, small, medium, large)
-LANGUAGE = "zh"                    # 识别语言 ('zh' 为中文)
-RECORD_DURATION = 6                # 录音时长（秒）
-SAMPLE_RATE = 16000                # Whisper 推荐 16kHz 采样率
+DEEPSEEK_API_KEY = "sk-xx"
+SAMPLE_RATE = 16000
+FRAME_DURATION_MS = 30
+VAD_MODE = 3
+SILENCE_TIMEOUT = 1.0
 # ===========================================
 
-def record_audio(filename="temp_record.wav"):
-    """第一步：录音并保存"""
-    print(f"🎙️ 准备录音... ({RECORD_DURATION}秒)")
-    print("🔴 录音开始...")
-    audio_data = sd.rec(int(RECORD_DURATION * SAMPLE_RATE), 
-                        samplerate=SAMPLE_RATE, channels=1, dtype='float32')
-    sd.wait()  
-    print("🟢 录音结束！")
-    write(filename, SAMPLE_RATE, (audio_data * 32767).astype(np.int16))
-    return filename
+print("=" * 50)
+print("🤖 语音对话机器人已启动（Paraformer 中文识别）")
+print("直接说话即可，说完停顿自动识别")
+print("按 Ctrl+C 退出")
+print("=" * 50)
 
-def transcribe_audio(audio_path):
-    """第二步：Whisper 语音转文字"""
-    print("🤖 正在加载 Whisper 模型...")
-    model = whisper.load_model(MODEL_SIZE)
+# 1. 加载模型时：禁用更新检查
+print("🤖 正在加载 Paraformer 中文语音识别模型...")
+asr_model = AutoModel(
+    model="paraformer-zh",
+    disable_update=True,  # 这里已经设置，很好
+    disable_pbar=True,
+    disable_log=True
+)
+print("✅ 模型加载完成！\n")
+
+# 初始化 VAD
+vad = webrtcvad.Vad()
+vad.set_mode(VAD_MODE)
+
+def is_speech(frame_bytes):
+    return vad.is_speech(frame_bytes, SAMPLE_RATE)
+
+def record_until_silence():
+    print("🎙️ 请说话...")
+    audio_frames = []
+    silence_frames = 0
+    max_silence_frames = int((SILENCE_TIMEOUT * 1000) / FRAME_DURATION_MS)
+    frame_size = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000 * 2)
+
+    def audio_callback(indata, frames, time_info, status):
+        nonlocal silence_frames
+        frame_bytes = (indata * 32767).astype(np.int16).tobytes()
+        if is_speech(frame_bytes):
+            audio_frames.append(indata.copy())
+            silence_frames = 0
+        else:
+            silence_frames += 1
+            if audio_frames:
+                audio_frames.append(indata.copy())
+
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32',
+                        blocksize=frame_size // 2, callback=audio_callback):
+        while silence_frames < max_silence_frames:
+            time.sleep(FRAME_DURATION_MS / 1000)
+
+    print("✅ 语音输入结束！")
+    return np.concatenate(audio_frames, axis=0) if audio_frames else None
+
+def transcribe_audio(audio_data):
     print("🎧 正在识别语音...")
-    result = model.transcribe(audio_path, language=LANGUAGE)
-    user_text = result["text"].strip()
-    print(f"👤 你说: {user_text}")
-    return user_text
+    temp_file = "temp_vad.wav"
+    write(temp_file, SAMPLE_RATE, (audio_data * 32767).astype(np.int16))
+    
+    # 2. 生成结果时：必须加上 disable_update=True
+    # 这是解决卡顿的关键！否则每次识别都会尝试联网检查模型更新
+    result = asr_model.generate(
+        input=temp_file,
+        disable_update=True  # ⚠️ 核心修复：禁止在推理时检查更新
+    )
+    
+    text = result[0]["text"].strip() if result else ""
+    if text:
+        print(f"👤 你说: {text}")
+    else:
+        print("⚠️ 未识别到有效语音")
+    return text
 
 def ask_deepseek(prompt):
-    """第三步：发送给 DeepSeek 获取回答"""
+    """调用 DeepSeek 获取回复"""
     if not prompt:
         return "我没有听清，请再说一遍。"
-    
-    print("🧠 正在思考中...")
+
+    print("🧠 思考中...")
     try:
         client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
         response = client.chat.completions.create(
             model="deepseek-chat",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": "你是一个语音对话助手，请用纯文本回复，不要使用任何 Markdown 格式（不要加粗、不要标题、不要代码块、不要用特殊符号装饰），直接返回自然的文字即可。"},
+                {"role": "user", "content": prompt}
+            ],
             stream=False
         )
-        ai_reply = response.choices[0].message.content
-        print(f"🤖 DeepSeek: {ai_reply}")
-        return ai_reply
+        reply = response.choices[0].message.content
+        print(f"🤖 回复: {reply}\n")
+        return reply
     except Exception as e:
         print(f"❌ 调用 DeepSeek 失败: {e}")
         return "抱歉，我在思考时遇到了一些问题。"
 
+
 def speak_text(text):
-    """第四步：TTS 语音播报（已修复 espeak 弱引用报错）"""
-    print("🔊 正在合成语音并播报...")
-    engine = None  # 显式声明，防止变量作用域问题
+    if not text:
+        return
+    print("🔊 正在播报...")
     try:
-        engine = pyttsx3.init(driverName='espeak')
-        
-        # 尝试匹配中文语音
-        voices = engine.getProperty('voices')
-        for voice in voices:
-            # 兼容不同系统对中文语音的命名方式
-            if 'zh-cn' in [lang.lower() for lang in voice.languages] or 'chinese' in voice.name.lower():
-                engine.setProperty('voice', voice.id)
-                break
-                
-        # 播报文本并等待完成
-        engine.say(text)
-        engine.runAndWait()
-        
+        communicate = edge_tts.Communicate(text, voice="zh-CN-YunxiaNeural")
+        mp3_data = io.BytesIO()
+        for chunk in communicate.stream_sync():
+            if chunk["type"] == "audio":
+                mp3_data.write(chunk["data"])
+        mp3_data.seek(0)
+        audio = AudioSegment.from_mp3(mp3_data)
+        play(audio)
     except Exception as e:
         print(f"❌ TTS 播报失败: {e}")
-    finally:
-        # 关键修复：播报结束后，手动停止并销毁引擎，防止弱引用报错
-        if engine is not None:
-            try:
-                engine.stop()
-            except Exception:
-                pass
+
+def main_loop():
+    try:
+        while True:
+            audio_data = record_until_silence()
+            if audio_data is None:
+                continue
+            user_text = transcribe_audio(audio_data)
+            if not user_text:
+                continue
+            ai_reply = ask_deepseek(user_text)
+            speak_text(ai_reply)
+            print("-" * 30)
+            print("🎙️ 请继续说话...")
+    except KeyboardInterrupt:
+        print("\n\n👋 再见！")
 
 if __name__ == "__main__":
-    temp_audio = "temp_record.wav"
-    
-    # 执行完整的闭环流程
-    record_audio(temp_audio)
-    user_text = transcribe_audio(temp_audio)
-    ai_reply = ask_deepseek(user_text)
-    speak_text(ai_reply)
-    
-    # 清理临时录音文件
-    if os.path.exists(temp_audio):
-        os.remove(temp_audio)
+    main_loop()
