@@ -3,21 +3,38 @@ import numpy as np
 from scipy.io.wavfile import write
 from funasr import AutoModel
 from openai import OpenAI
-import edge_tts
 from pydub import AudioSegment
 from pydub.playback import play
-import io
 import webrtcvad
 import time
 import os
+import re
+import piper
 
 # ================= 配置区 =================
-DEEPSEEK_API_KEY = "sk-xx"
+DEEPSEEK_API_KEY = "sk-xxx"
 SAMPLE_RATE = 16000
 FRAME_DURATION_MS = 30
 VAD_MODE = 3
 SILENCE_TIMEOUT = 1.0
+MODEL_PATH = "piper_models/zh_CN-huayan-medium.onnx"
 # ===========================================
+
+piper_voice = None
+
+def init_tts():
+    global piper_voice
+    if not os.path.exists(MODEL_PATH):
+        print(f"❌ 模型文件不存在: {MODEL_PATH}")
+        return False
+    print(f"🔄 正在加载模型: {MODEL_PATH}")
+    try:
+        piper_voice = piper.PiperVoice.load(MODEL_PATH)
+        print(f"✅ 模型加载成功！采样率: {piper_voice.config.sample_rate}")
+        return True
+    except Exception as e:
+        print(f"❌ 模型加载失败: {e}")
+        return False
 
 print("=" * 50)
 print("🤖 语音对话机器人已启动（Paraformer 中文识别）")
@@ -87,6 +104,7 @@ def transcribe_audio(audio_data):
         print("⚠️ 未识别到有效语音")
     return text
 
+
 def ask_deepseek(prompt):
     """调用 DeepSeek 获取回复"""
     if not prompt:
@@ -110,20 +128,46 @@ def ask_deepseek(prompt):
         print(f"❌ 调用 DeepSeek 失败: {e}")
         return "抱歉，我在思考时遇到了一些问题。"
 
-
 def speak_text(text):
     if not text:
         return
-    print("🔊 正在播报...")
+    print(f"\n🔊 正在播报: {text}")
     try:
-        communicate = edge_tts.Communicate(text, voice="zh-CN-YunxiaNeural")
-        mp3_data = io.BytesIO()
-        for chunk in communicate.stream_sync():
-            if chunk["type"] == "audio":
-                mp3_data.write(chunk["data"])
-        mp3_data.seek(0)
-        audio = AudioSegment.from_mp3(mp3_data)
-        play(audio)
+        # 按标点分段
+        sentences = re.split(r'([。！？；\n])', text)
+        chunks = []
+        current_chunk = ""
+        for seg in sentences:
+            if not seg.strip():
+                continue
+            if seg in "。！？；\n":
+                current_chunk += seg
+                if len(current_chunk) > 100:
+                    chunks.append(current_chunk.strip())
+                    current_chunk = ""
+            else:
+                current_chunk += seg
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+        
+        if not chunks:
+            return
+
+        for i, chunk_text in enumerate(chunks):
+            print(f"   → 合成第 {i+1}/{len(chunks)} 段...")
+            
+            # synthesize 返回 AudioChunk 对象的 generator
+            # 每个 AudioChunk 有 audio_int16_bytes 属性
+            all_bytes = b"".join(chunk.audio_int16_bytes for chunk in piper_voice.synthesize(chunk_text))
+            
+            # 转成 numpy int16 数组
+            audio_data = np.frombuffer(all_bytes, dtype=np.int16)
+            
+            # 播放
+            sd.play(audio_data, samplerate=piper_voice.config.sample_rate)
+            sd.wait()
+
+        print("✅ 播报完成")
     except Exception as e:
         print(f"❌ TTS 播报失败: {e}")
 
@@ -144,4 +188,5 @@ def main_loop():
         print("\n\n👋 再见！")
 
 if __name__ == "__main__":
+    init_tts()
     main_loop()
